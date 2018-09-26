@@ -157,6 +157,9 @@ func sendToRoute(url string, msg []byte) {
 }
 
 func addTopic(topicName string) error {
+	m.Lock()
+	defer m.Unlock()
+	
 	_, ok := m.topics[topicName]
 	if ok {
 		return fmt.Errorf("could not create Topic %s, it already exists", topicName)
