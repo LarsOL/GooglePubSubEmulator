@@ -3,43 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"github.com/LarsOL/GooglePubSubEmulator/pubsubstore"
 	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"google.golang.org/api/pubsub/v1"
 )
 
-// FUTURE make injectable instance
-var m Mapping = Mapping{}
-
-func init() {
-	m.topics = make(map[string]Topic)
-}
-
-type Topic struct {
-	Id            string
-	subscriptions map[string]Subscription
-}
-
-type Subscription struct {
-	Id  string
-	Url string
-}
-
-type Mapping struct {
-	sync.RWMutex
-	topics map[string]Topic
-}
+var defaultStore *pubsubstore.Store
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	defaultStore = pubsubstore.NewStore()
 }
 
 func CreateTopic(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +27,7 @@ func CreateTopic(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
 	topicName := v["topicName"]
 
-	if err := addTopic(topicName); err != nil {
+	if err := defaultStore.AddTopic(topicName); err != nil {
 		HttpErrorLog(w, err, http.StatusBadRequest)
 		return
 	}
@@ -66,7 +46,14 @@ func CreateSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := addSub(sub, subId); err != nil {
+	shortTopicName := sub.Topic[len(topicPrefix):]
+	t, err := defaultStore.GetTopic(shortTopicName)
+	if err != nil {
+		HttpErrorLog(w, err, http.StatusBadRequest)
+		return
+	}
+
+	if err := t.AddSub(sub, subId); err != nil {
 		HttpErrorLog(w, err, http.StatusBadRequest)
 		return
 	}
@@ -78,10 +65,18 @@ func DeleteSub(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
 	subId := v["subId"]
 
-	if err := removeSub(subId); err != nil {
+
+	t, s, err := defaultStore.FindSub(subId)
+	if err != nil {
 		HttpErrorLog(w, err, http.StatusBadRequest)
 		return
 	}
+
+	if err := t.RemoveSub(s.GetID()); err != nil {
+		HttpErrorLog(w, err, http.StatusBadRequest)
+		return
+	}
+
 	log.Printf("Deleted sub: %s \n", subId)
 }
 
@@ -113,7 +108,13 @@ func PublishToTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	routes, err := getRoutes(topic)
+	t, err := defaultStore.GetTopic(topic)
+	if err != nil {
+		HttpErrorLog(w, err, http.StatusBadRequest)
+		return
+	}
+
+	routes, err := t.GetRoutes()
 	if err != nil {
 		HttpErrorLog(w, err, http.StatusBadRequest)
 		return
@@ -124,7 +125,7 @@ func PublishToTopic(w http.ResponseWriter, r *http.Request) {
 			Message: MessageType{
 				msg.Attributes,
 				msg.Data,
-				RandStringRunes(5),
+				RandString(5),
 			},
 			Subscription: "Subscription",
 		}
@@ -150,85 +151,21 @@ func sendToRoute(url string, msg []byte) {
 		return
 	}
 	if resp.StatusCode != 200 {
-		log.Printf("Serivce on %s returned status %d, THIS WOULD NORMALLY RETRY got err %s\n", url, resp.StatusCode, err.Error())
+		log.Printf("Serivce on %s returned status %d, THIS WOULD NORMALLY RETRY \n", url, resp.StatusCode)
 		return
 	}
 	log.Printf("Message sent to %s with len %d %v\n", url, len(msg), string(msg))
 }
 
-func addTopic(topicName string) error {
-	m.Lock()
-	defer m.Unlock()
-	
-	_, ok := m.topics[topicName]
-	if ok {
-		return fmt.Errorf("could not create Topic %s, it already exists", topicName)
-	}
-
-	m.topics[topicName] = Topic{
-		Id:            topicName,
-		subscriptions: make(map[string]Subscription),
-	}
-
-	return nil
-}
-
 const topicPrefix = "projects/localhost/topics/"
 
-func addSub(s *pubsub.Subscription, id string) error {
-	m.Lock()
-	defer m.Unlock()
-
-	shortTopicName := s.Topic[len(topicPrefix):]
-	topic, ok := m.topics[shortTopicName]
-	if !ok {
-		return fmt.Errorf("could not create sub %s Topic %s does not exist", id, shortTopicName)
-
-	}
-
-	topic.subscriptions[id] = Subscription{
-		Id:  id,
-		Url: s.PushConfig.PushEndpoint,
-	}
-	return nil
-}
-
-func removeSub(Id string) error {
-	m.Lock()
-	defer m.Unlock()
-
-	for _, topic := range m.topics {
-		_, ok := topic.subscriptions[Id]
-		if ok {
-			delete(topic.subscriptions, Id)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("Could not delete sub %s because it doesn't exsist", Id)
-}
-
-func getRoutes(topic string) ([]string, error) {
-	m.RLock()
-	defer m.RUnlock()
-
-	t, ok := m.topics[topic]
-	if !ok {
-		return nil, fmt.Errorf("Could not get route info for topic %s because it doesn't exsist", topic)
-	}
-
-	routeURLs := []string{}
-	for _, v := range t.subscriptions {
-		routeURLs = append(routeURLs, v.Url)
-	}
-	return routeURLs, nil
-}
 
 func Health(w http.ResponseWriter, _ *http.Request) {
-	w.Write([]byte("pub sub is running OK!!"))
+	_,_ = w.Write([]byte("pub sub is running OK!!"))
 }
 
-func RunServer(addr string) {
+func RunServer(port string) {
+	addr := ":" + port
 	os.Setenv("PUBSUB_EMULATOR_HOST", "localhost"+addr)
 	r := mux.NewRouter()
 	r.Methods(http.MethodPut).Path("/v1/projects/localhost/topics/{topicName}").HandlerFunc(CreateTopic)
@@ -236,11 +173,16 @@ func RunServer(addr string) {
 	r.Methods(http.MethodDelete).Path("/v1/projects/localhost/subscriptions/{subId}").HandlerFunc(DeleteSub)
 	r.Methods(http.MethodPost).Path("/v1/projects/localhost/topics/{topic}:publish").HandlerFunc(PublishToTopic)
 	r.Methods(http.MethodGet).Path("/v1/projects/localhost/subscriptions").HandlerFunc(Health)
+	log.Printf("Starting server on %s\n", addr)
 	log.Fatal(http.ListenAndServe(addr, r))
 }
 
 func main() {
-	RunServer(":8010")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8010"
+	}
+	RunServer(port)
 }
 
 func HttpErrorLog(w http.ResponseWriter, err error, code int) {
@@ -251,8 +193,8 @@ func HttpErrorLog(w http.ResponseWriter, err error, code int) {
 // https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-func RandStringRunes(n int) string {
-	b := make([]rune, n)
+func RandString(length int) string {
+	b := make([]rune, length)
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
